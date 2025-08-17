@@ -58,8 +58,8 @@ async function loginWithPuppeteer() {
   try {
     await page.goto("https://app.blasttv.ph/login", { waitUntil: "networkidle2" });
 
-    await page.type("#email", process.env.BLASTTV_EMAIL || "candadofrances@gmail.com");
-    await page.type("#secret", process.env.BLASTTV_PASS || "Lmatt0603!");
+    await page.type("#email", process.env.BLASTTV_EMAIL || "Email");
+    await page.type("#secret", process.env.BLASTTV_PASS || "Password");
 
     await Promise.all([
       page.click("button[data-test-id='submit-btn-login']"),
