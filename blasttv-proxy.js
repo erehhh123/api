@@ -2,35 +2,38 @@ const express = require("express");
 const axios = require("axios");
 const { Parser } = require("m3u8-parser");
 const puppeteer = require("puppeteer");
-const fs = require("fs");
 
 const app = express();
 const PORT = 3000;
 
+// ---- AUTH STATE ----
 let bearerToken = "";
 let refreshToken = "";
 let lastTokenRefresh = 0;
 
-const REFRESH_INTERVAL = 15 * 60 * 1000;
-const CACHE_TTL = 30 * 1000;
+// ---- CACHE ----
+let cachedStreams = [];
+let lastCacheTime = 0;
+const CACHE_TTL = 30 * 1000; // 30s
+const REFRESH_INTERVAL = 15 * 60 * 1000; // 15 min
+
+// ---- API URLS ----
 const REFRESH_URL = "https://app.blasttv.ph/api/v2/token/refresh";
+const LIVE_EVENTS_URL = "https://app.blasttv.ph/api/v2/event/live?p=1&rpp=25";
 const EVENT_METADATA_URL = (id) =>
   `https://app.blasttv.ph/api/v4/event/${id}?includePlaybackDetails=URL&displayGeoblocked=HIDE`;
-const CACHE_FILE = "./cache.json";
 
-// Replace this with event IDs you want to fetch
-const KNOWN_EVENT_IDS = [274551]; // Add more as needed
-
+// ---- AUTH HELPERS ----
 async function refreshTokenIfNeeded() {
   if (Date.now() - lastTokenRefresh < REFRESH_INTERVAL) return;
   if (!refreshToken) return loginWithPuppeteer();
 
   try {
-    const res = await axios.post(REFRESH_URL, {}, {
-      headers: {
-        Authorization: `Bearer ${refreshToken}`,
-      }
-    });
+    const res = await axios.post(
+      REFRESH_URL,
+      {},
+      { headers: { Authorization: `Bearer ${refreshToken}` } }
+    );
 
     if (res.data?.token) {
       bearerToken = res.data.token;
@@ -38,7 +41,7 @@ async function refreshTokenIfNeeded() {
       lastTokenRefresh = Date.now();
       console.log("✅ Token refreshed");
     } else {
-      console.warn("⚠️ Token refresh failed. Trying Puppeteer...");
+      console.warn("⚠️ Refresh failed, relogging...");
       await loginWithPuppeteer();
     }
   } catch (err) {
@@ -49,13 +52,15 @@ async function refreshTokenIfNeeded() {
 
 async function loginWithPuppeteer() {
   console.log("🧪 Logging in with Puppeteer...");
-  const browser = await puppeteer.launch({ headless: false, slowMo: 100 });
+  const browser = await puppeteer.launch({ headless: true });
   const page = await browser.newPage();
 
   try {
     await page.goto("https://app.blasttv.ph/login", { waitUntil: "networkidle2" });
-    await page.type("#email", "candadofrances@gmail.com");
-    await page.type("#secret", "Lmatt0603!");
+
+    await page.type("#email", process.env.BLASTTV_EMAIL || "candadofrances@gmail.com");
+    await page.type("#secret", process.env.BLASTTV_PASS || "Lmatt0603!");
+
     await Promise.all([
       page.click("button[data-test-id='submit-btn-login']"),
       page.waitForNavigation({ waitUntil: "networkidle2" }),
@@ -64,8 +69,7 @@ async function loginWithPuppeteer() {
     const tokenDump = await page.evaluate(() => {
       const dump = {};
       for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        dump[key] = localStorage.getItem(key);
+        dump[localStorage.key(i)] = localStorage.getItem(localStorage.key(i));
       }
       return dump;
     });
@@ -74,16 +78,44 @@ async function loginWithPuppeteer() {
     refreshToken = tokenDump["dice:refreshToken"];
     lastTokenRefresh = Date.now();
 
-    if (bearerToken) {
-      console.log("✅ New token from Puppeteer");
-    } else {
-      console.error("❌ Failed to extract authToken");
-    }
+    console.log("✅ Puppeteer login successful");
   } catch (err) {
     console.error("❌ Puppeteer login failed:", err.message);
   } finally {
     await browser.close();
   }
+}
+
+// ---- AXIOS INSTANCE WITH INTERCEPTORS ----
+const api = axios.create();
+api.interceptors.request.use((config) => {
+  if (bearerToken) {
+    config.headers["Authorization"] = `Bearer ${bearerToken}`;
+  }
+  config.headers["x-api-key"] = "857a1e5d-e35e-4fdf-805b-a87b6f8364bf";
+  config.headers["app"] = "dice";
+  config.headers["realm"] = "dce.tapgo";
+  return config;
+});
+
+api.interceptors.response.use(
+  (res) => res,
+  async (error) => {
+    if (error.response && error.response.status === 401) {
+      console.warn("⚠️ 401 detected, refreshing token...");
+      await refreshTokenIfNeeded();
+      if (bearerToken) {
+        error.config.headers["Authorization"] = `Bearer ${bearerToken}`;
+        return api.request(error.config);
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
+// ---- UTILS ----
+function slugify(text) {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
 async function getStreamVariants(url) {
@@ -92,116 +124,101 @@ async function getStreamVariants(url) {
     const parser = new Parser();
     parser.push(res.data);
     parser.end();
-    return parser.manifest.playlists.map(p => ({
+    return parser.manifest.playlists.map((p) => ({
       resolution: p.attributes.RESOLUTION?.height + "p",
       bandwidth: p.attributes.BANDWIDTH,
-      uri: p.uri
+      uri: p.uri,
     }));
   } catch (err) {
-    console.warn("⚠️ Variant parse error:", err.message);
+    console.warn("⚠️ Variant parse failed:", err.message);
     return [];
   }
 }
 
-async function getChannelsWithStreams() {
+// ---- MAIN FETCH ----
+async function getChannelsWithStreams(force = false) {
+  if (!force && Date.now() - lastCacheTime < CACHE_TTL && cachedStreams.length > 0) {
+    console.log("📦 Serving from cache");
+    return cachedStreams;
+  }
+
   await refreshTokenIfNeeded();
   const streams = [];
 
   try {
-    const liveRes = await axios.get("https://app.blasttv.ph/api/v2/event/live?p=1&rpp=25", {
-      headers: {
-        Authorization: `Bearer ${bearerToken}`,
-        "x-api-key": "857a1e5d-e35e-4fdf-805b-a87b6f8364bf",
-        app: "dice",
-        realm: "dce.tapgo",
-        "User-Agent": "Mozilla/5.0",
-      }
-    });
+    const liveRes = await api.get(LIVE_EVENTS_URL);
+    const events = Array.isArray(liveRes.data) ? liveRes.data : liveRes.data?.data || [];
+    console.log("🔎 Found", events.length, "live events");
 
-    const liveEvents = liveRes.data?.data || [];
-
-    for (const event of liveEvents) {
-      const eventId = event?.id;
-      const title = event?.event_title || "Untitled";
-      const channelId = event?.channel_id;
+    for (const event of events) {
+      const eventId = event.id;
+      const title = event.event_title || "Untitled";
+      const slug = slugify(title);
 
       try {
-        const metaRes = await axios.get(EVENT_METADATA_URL(eventId), {
-          headers: {
-            Authorization: `Bearer ${bearerToken}`,
-            "x-api-key": "857a1e5d-e35e-4fdf-805b-a87b6f8364bf",
-            app: "dice",
-          }
-        });
+        const metaRes = await api.get(EVENT_METADATA_URL(eventId));
+        const masterUrl = metaRes.data?.playback?.urls?.find((u) => u.format === "HLS")?.url;
+        if (!masterUrl) continue;
 
-        const playback = metaRes.data?.playback;
-        const masterUrl = playback?.urls?.find(u => u.format === "HLS")?.url;
-
-        if (masterUrl) {
-          const variants = await getStreamVariants(masterUrl);
-          const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-
-          streams.push({
-            title,
-            slug,
-            channel_id: channelId,
-            event_id: eventId,
-            master_url: masterUrl,
-            variants
-          });
-        } else {
-          console.warn(`⚠️ No HLS URL for event ${eventId} (${title})`);
-        }
-
+        const variants = await getStreamVariants(masterUrl);
+        streams.push({ title, slug, event_id: eventId, master_url: masterUrl, variants });
       } catch (err) {
-        console.warn(`⚠️ Error fetching metadata for event ${eventId}: ${err.message}`);
+        console.warn(`⚠️ Event ${eventId} metadata failed:`, err.message);
       }
     }
 
+    cachedStreams = streams;
+    lastCacheTime = Date.now();
+    return streams;
   } catch (err) {
-    console.error("❌ Failed to fetch live events:", err.message);
-  }
-
-  return streams;
-}
-
-function loadCache() {
-  try {
-    return JSON.parse(fs.readFileSync(CACHE_FILE, "utf-8"));
-  } catch {
-    return { timestamp: 0, streams: [] };
+    console.error("❌ Live events fetch failed:", err.message);
+    return cachedStreams; // fallback
   }
 }
 
-function saveCache(data) {
-  fs.writeFileSync(CACHE_FILE, JSON.stringify(data, null, 2));
-}
-
+// ---- ROUTES ----
 app.get("/streams", async (req, res) => {
-  const cache = loadCache();
-  if (Date.now() - cache.timestamp < CACHE_TTL) {
-    return res.json({ cached: true, ...cache });
-  }
+  const keyword = req.query.search?.toLowerCase() || "";
+  const allStreams = await getChannelsWithStreams();
+  const filtered = keyword
+    ? allStreams.filter((s) => s.title.toLowerCase().includes(keyword))
+    : allStreams;
 
-  const streams = await getChannelsWithStreams();
-  const result = { timestamp: Date.now(), streams };
-  saveCache(result);
-  res.json({ cached: false, ...result });
+  res.json({
+    cached: Date.now() - lastCacheTime < CACHE_TTL,
+    timestamp: Date.now(),
+    streams: filtered,
+  });
 });
 
-app.get("/play/:channelId/playlist.m3u8", async (req, res) => {
-  const { channelId } = req.params;
-  const cache = loadCache();
-  const stream = cache.streams.find(s => s.channel_id == channelId);
-
-  if (!stream) return res.status(404).send("Channel not found");
+// raw playback
+app.get("/play/:slug/playlist.m3u8", async (req, res) => {
+  const stream = (await getChannelsWithStreams()).find((s) => s.slug === req.params.slug);
+  if (!stream) return res.status(404).send("Stream not found");
 
   try {
-    const m3u8Res = await axios.get(stream.master_url);
+    const { data } = await axios.get(stream.master_url);
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-    res.send(m3u8Res.data);
+    res.send(data);
   } catch {
     res.status(500).send("Failed to fetch playlist");
+  }
+});
+
+// proxy & rewrite (absolute URLs)
+app.get("/proxy/:slug/playlist.m3u8", async (req, res) => {
+  const stream = (await getChannelsWithStreams()).find((s) => s.slug === req.params.slug);
+  if (!stream) return res.status(404).send("Stream not found");
+
+  try {
+    const { data } = await axios.get(stream.master_url);
+    const baseUrl = new URL(stream.master_url).origin + new URL(stream.master_url).pathname.replace(/\/[^\/]+$/, "/");
+
+    const rewritten = data.replace(/^(?!#)(.+\.m3u8|.+\.ts)/gm, (line) => `${baseUrl}${line}`);
+    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+    res.send(rewritten);
+  } catch {
+    res.status(500).send("Failed to rewrite playlist");
   }
 });
 
